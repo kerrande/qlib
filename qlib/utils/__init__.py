@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Union, Tuple
 
 from ..config import C
-from ..log import get_module_logger
+from ..log import get_module_logger, set_log_with_config
 
 log = get_module_logger("utils")
 
@@ -162,7 +162,7 @@ def parse_field(field):
     # - $open+$close -> Feature("open")+Feature("close")
     if not isinstance(field, str):
         field = str(field)
-    return re.sub(r"\$(\w+)", r'Feature("\1")', field)
+    return re.sub(r"\$(\w+)", r'Feature("\1")', re.sub(r"(\w+\s*)\(", r"Operators.\1(", field))
 
 
 def get_module_by_module_path(module_path):
@@ -279,8 +279,10 @@ def compare_dict_value(src_data: dict, dst_data: dict):
 def create_save_path(save_path=None):
     """Create save path
 
-    :param save_path:
-    :return:
+    Parameters
+    ----------
+    save_path: str
+
     """
     if save_path:
         if not os.path.exists(save_path):
@@ -471,30 +473,28 @@ def is_tradable_date(cur_date):
     return str(cur_date.date()) == str(D.calendar(start_time=cur_date, future=True)[0].date())
 
 
-def get_date_range(trading_date, shift, future=False):
+def get_date_range(trading_date, left_shift=0, right_shift=0, future=False):
     """get trading date range by shift
 
-    :param trading_date:
-    :param shift: int
-    :param future: bool
-    :return:
+    Parameters
+    ----------
+    trading_date: pd.Timestamp
+    left_shift: int
+    right_shift: int
+    future: bool
+
     """
+
     from ..data import D
 
-    calendar = D.calendar(future=future)
-    if pd.to_datetime(trading_date) not in list(calendar):
-        raise ValueError("{} is not trading day!".format(str(trading_date)))
-    day_index = bisect.bisect_left(calendar, trading_date)
-    if 0 <= (day_index + shift) < len(calendar):
-        if shift > 0:
-            return calendar[day_index + 1 : day_index + 1 + shift]
-        else:
-            return calendar[day_index + shift : day_index]
-    else:
-        return calendar
+    start = get_date_by_shift(trading_date, left_shift, future=future)
+    end = get_date_by_shift(trading_date, right_shift, future=future)
+
+    calendar = D.calendar(start, end, future=future)
+    return calendar
 
 
-def get_date_by_shift(trading_date, shift, future=False):
+def get_date_by_shift(trading_date, shift, future=False, clip_shift=True):
     """get trading date with shift bias wil cur_date
         e.g. : shift == 1,  return next trading date
                shift == -1, return previous trading date
@@ -502,8 +502,22 @@ def get_date_by_shift(trading_date, shift, future=False):
     trading_date : pandas.Timestamp
         current date
     shift : int
+    clip_shift: bool
+
     """
-    return get_date_range(trading_date, shift, future)[0 if shift < 0 else -1] if shift != 0 else trading_date
+    from qlib.data import D
+
+    cal = D.calendar(future=future)
+    if pd.to_datetime(trading_date) not in list(cal):
+        raise ValueError("{} is not trading day!".format(str(trading_date)))
+    _index = bisect.bisect_left(cal, trading_date)
+    shift_index = _index + shift
+    if shift_index < 0 or shift_index >= len(cal):
+        if clip_shift:
+            shift_index = np.clip(shift_index, 0, len(cal) - 1)
+        else:
+            raise IndexError(f"The shift_index({shift_index}) of the trading day ({trading_date}) is out of range")
+    return cal[shift_index]
 
 
 def get_next_trading_date(trading_date, future=False):
@@ -629,13 +643,26 @@ def exists_qlib_data(qlib_dir):
     # check instruments
     code_names = set(map(lambda x: x.name.lower(), features_dir.iterdir()))
     _instrument = instruments_dir.joinpath("all.txt")
-    df = pd.read_csv(_instrument, sep="\t", names=["inst", "start_datetime", "end_datetime", "save_inst"])
-    df = df.iloc[:, [0, -1]].fillna(axis=1, method="ffill")
-    miss_code = set(df.iloc[:, -1].apply(str.lower)) - set(code_names)
+    miss_code = set(pd.read_csv(_instrument, sep="\t", header=None).loc[:, 0].apply(str.lower)) - set(code_names)
     if miss_code and any(map(lambda x: "sht" not in x, miss_code)):
         return False
 
     return True
+
+
+def check_qlib_data(qlib_config):
+    inst_dir = Path(qlib_config["provider_uri"]).joinpath("instruments")
+    for _p in inst_dir.glob("*.txt"):
+        try:
+            assert len(pd.read_csv(_p, sep="\t", nrows=0, header=None).columns) == 3, (
+                f"\nThe {str(_p.resolve())} of qlib data is not equal to 3 columns:"
+                f"\n\tIf you are using the data provided by qlib: "
+                f"https://qlib.readthedocs.io/en/latest/component/data.html#qlib-format-dataset"
+                f"\n\tIf you are using your own data, please dump the data again: "
+                f"https://qlib.readthedocs.io/en/latest/component/data.html#converting-csv-format-into-qlib-format"
+            )
+        except AssertionError:
+            raise
 
 
 def lazy_sort_index(df: pd.DataFrame, axis=0) -> pd.DataFrame:
@@ -728,3 +755,36 @@ def load_dataset(path_or_obj):
     elif extension == ".csv":
         return pd.read_csv(path_or_obj, parse_dates=True, index_col=[0, 1])
     raise ValueError(f"unsupported file type `{extension}`")
+
+
+def code_to_fname(code: str):
+    """stock code to file name
+
+    Parameters
+    ----------
+    code: str
+    """
+    # NOTE: In windows, the following name is I/O device, and the file with the corresponding name cannot be created
+    # reference: https://superuser.com/questions/86999/why-cant-i-name-a-folder-or-file-con-in-windows
+    replace_names = ["CON", "PRN", "AUX", "NUL"]
+    replace_names += [f"COM{i}" for i in range(10)]
+    replace_names += [f"LPT{i}" for i in range(10)]
+
+    prefix = "_qlib_"
+    if str(code).upper() in replace_names:
+        code = prefix + str(code)
+
+    return code
+
+
+def fname_to_code(fname: str):
+    """file name to stock code
+
+    Parameters
+    ----------
+    fname: str
+    """
+    prefix = "_qlib_"
+    if fname.startswith(prefix):
+        fname = fname.lstrip(prefix)
+    return fname
